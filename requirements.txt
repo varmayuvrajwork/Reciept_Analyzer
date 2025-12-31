@@ -1,0 +1,9 @@
+pillow
+opencv-python
+google-cloud-vision
+langchain-community
+langchain-openai
+flask
+faiss-cpu
+openai
+python-dotenv
