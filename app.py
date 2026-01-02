@@ -3,43 +3,56 @@ import os
 import re
 import base64
 from typing import Dict
+
 from flask import Flask, request, jsonify, render_template
 from dotenv import load_dotenv
-import google.cloud.vision as vision
-from google import genai
-from crewai import Agent, Task, Crew
 
+import google.cloud.vision as vision
+
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
+
+# -------------------------------------------------
+# ENV SETUP
+# -------------------------------------------------
 load_dotenv()
 
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY is required")
 
 app = Flask(__name__, template_folder="templates")
 analyzed_data: Dict = {}
 
-class GeminiLLM:
-    def __init__(self, model="gemini-3-pro"):
-        self.model = model
+# -------------------------------------------------
+# GEMINI LLM (LANGCHAIN)
+# -------------------------------------------------
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-pro",
+    temperature=0,
+    google_api_key=GEMINI_API_KEY
+)
 
-    def __call__(self, prompt: str) -> str:
-        response = client.models.generate_content(
-            model=self.model,
-            contents=prompt
-        )
-        return response.text
-
+# -------------------------------------------------
+# GOOGLE VISION OCR
+# -------------------------------------------------
 def vision_ai_ocr(image_path: str) -> str:
     client = vision.ImageAnnotatorClient()
-    with io.open(image_path, 'rb') as image_file:
+    with io.open(image_path, "rb") as image_file:
         content = image_file.read()
 
     image = vision.Image(content=content)
     response = client.text_detection(image=image)
 
     if response.error.message:
-        raise Exception(f"OCR Error: {response.error.message}")
+        raise RuntimeError(f"OCR Error: {response.error.message}")
 
     return response.text_annotations[0].description if response.text_annotations else ""
 
+# -------------------------------------------------
+# RECEIPT CLASSIFICATION
+# -------------------------------------------------
 def classify_receipt(ocr_text: str) -> str:
     if re.search(r"subtotal|total|item|price", ocr_text, re.IGNORECASE):
         return "Shopping"
@@ -47,6 +60,9 @@ def classify_receipt(ocr_text: str) -> str:
         return "Parking"
     return "Miscellaneous"
 
+# -------------------------------------------------
+# DOMAIN EXTRACTION LOGIC (PRE-LLM)
+# -------------------------------------------------
 def analyze_shopping_receipt(ocr_text: str) -> str:
     lines = ocr_text.split("\n")
     items = []
@@ -75,104 +91,77 @@ def analyze_parking_receipt(ocr_text: str) -> str:
 
 def analyze_miscellaneous_receipt(ocr_text: str) -> str:
     lines = ocr_text.split("\n")
-    details = []
-
-    for line in lines:
-        if ":" in line:
-            details.append(line.strip())
-
+    details = [line.strip() for line in lines if ":" in line]
     return "\n".join(details) if details else "No structured data found."
 
-gemini_llm = GeminiLLM(model="gemini-3-pro")
+# -------------------------------------------------
+# LANGCHAIN PROMPTS
+# -------------------------------------------------
+receipt_analysis_prompt = PromptTemplate(
+    input_variables=["receipt_type", "ocr_text", "pre_data"],
+    template="""
+You are an expert receipt analyst.
 
-shopping_agent = Agent(
-    role="Shopping Receipt Analyst",
-    goal="Extract structured shopping receipt information",
-    backstory="Expert in retail receipts and invoices",
-    llm=gemini_llm,          
-    allow_delegation=False
+Receipt Type: {receipt_type}
+
+OCR Text:
+{ocr_text}
+
+Pre-extracted Data:
+{pre_data}
+
+Clean, improve, and summarize the receipt clearly for a human.
+"""
 )
 
-parking_agent = Agent(
-    role="Parking Receipt Analyst",
-    goal="Extract parking receipt details",
-    backstory="Expert in parking and transport receipts",
-    llm=gemini_llm,          
-    allow_delegation=False
+qa_prompt = PromptTemplate(
+    input_variables=["context", "question"],
+    template="""
+You are a precise assistant.
+
+Receipt Data:
+{context}
+
+Question:
+{question}
+
+Answer ONLY using the receipt data.
+"""
 )
 
-misc_agent = Agent(
-    role="Misc Receipt Analyst",
-    goal="Extract generic receipt information",
-    backstory="Expert in unstructured receipts",
-    llm=gemini_llm,          
-    allow_delegation=False
-)
+receipt_chain = LLMChain(llm=llm, prompt=receipt_analysis_prompt)
+qa_chain = LLMChain(llm=llm, prompt=qa_prompt)
 
-qa_agent = Agent(
-    role="Receipt Q&A Agent",
-    goal="Answer questions strictly from receipt text",
-    backstory="Accurate assistant that never hallucinates",
-    llm=gemini_llm,          
-    allow_delegation=False
-)
-
+# -------------------------------------------------
+# ANALYSIS PIPELINES
+# -------------------------------------------------
 def run_receipt_analysis(receipt_type: str, ocr_text: str) -> str:
     if receipt_type == "Shopping":
-        base_analysis = analyze_shopping_receipt(ocr_text)
-        agent = shopping_agent
+        pre_data = analyze_shopping_receipt(ocr_text)
     elif receipt_type == "Parking":
-        base_analysis = analyze_parking_receipt(ocr_text)
-        agent = parking_agent
+        pre_data = analyze_parking_receipt(ocr_text)
     else:
-        base_analysis = analyze_miscellaneous_receipt(ocr_text)
-        agent = misc_agent
+        pre_data = analyze_miscellaneous_receipt(ocr_text)
 
-    task = Task(
-        description=f"""
-        Receipt Type: {receipt_type}
+    result = receipt_chain.invoke({
+        "receipt_type": receipt_type,
+        "ocr_text": ocr_text,
+        "pre_data": pre_data
+    })
+    return result["text"]
 
-        OCR Text:
-        {ocr_text}
-
-        Pre-Extracted Data:
-        {base_analysis}
-
-        Improve, clean, and summarize the receipt data.
-        """,
-        agent=agent
-    )
-
-    crew = Crew(
-        agents=[agent],
-        tasks=[task],
-        verbose=False
-    )
-
-    return str(crew.kickoff())
 
 def run_qa(question: str, context: str) -> str:
-    task = Task(
-        description=f"""
-        Receipt Data:
-        {context}
+    result = qa_chain.invoke({
+        "context": context,
+        "question": question
+    })
+    return result["text"]
 
-        Question:
-        {question}
 
-        Answer ONLY from receipt data.
-        """,
-        agent=qa_agent
-    )
-
-    crew = Crew(
-        agents=[qa_agent],
-        tasks=[task],
-        verbose=False
-    )
-
-    return str(crew.kickoff())
-
+# -------------------------------------------------
+# FLASK ROUTES
+# -------------------------------------------------
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -199,13 +188,12 @@ def analyze_receipt():
     analyzed_data = {
         "full_text": ocr_text,
         "type": receipt_type,
-        "agent_analysis": agent_output
+        "analysis": agent_output
     }
 
     return (
         f"Receipt analyzed successfully.<br>"
-        f"<img src='data:image/jpeg;base64,{encoded_image}' "
-        f"style='width:300px;height:auto;' />",
+        f"<img src='data:image/jpeg;base64,{encoded_image}' style='width:300px;height:auto;' />",
         200
     )
 
@@ -221,5 +209,8 @@ def ask_question():
     answer = run_qa(question, analyzed_data["full_text"])
     return answer, 200
 
+# -------------------------------------------------
+# RUN
+# -------------------------------------------------
 if __name__ == "__main__":
     app.run(debug=True)

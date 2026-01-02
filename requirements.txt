@@ -9,5 +9,4 @@ openai
 python-dotenv
 document
 pytesseract
-crewai
-google-genai
+langchain-google-genai
