@@ -4,6 +4,10 @@ google-cloud-vision
 langchain-community
 langchain-openai
 flask
-faiss-cpu
+faiss-cpu==1.7.4
 openai
 python-dotenv
+document
+pytesseract
+crewai
+google-genai

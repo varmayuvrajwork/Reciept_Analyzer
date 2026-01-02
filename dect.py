@@ -4,7 +4,6 @@ from pytesseract import pytesseract, Output
 from PIL import Image
 import pandas as pd
 import os
-import
 def detect_text_regions_tesseract(image):
       """
       Detect text regions using Tesseract OCR.
