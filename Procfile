@@ -1,1 +1,1 @@
-web: python rec.py
+web: gunicorn rec:app --bind 0.0.0.0:$PORT
